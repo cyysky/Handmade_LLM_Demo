@@ -11,8 +11,10 @@ from model import GPT # Assuming model.py is in the same directory or accessible
 # Paths
 TOKENIZER_PATH = "data/tokenizer/custom_gpt_tokenizer.json"
 CORPUS_PATH = "data/pretraining_data/wikitext-103_train_corpus.txt" # Ensure this file exists
+CACHED_DATA_PATH = "data/pretraining_data/wikitext-103_train_corpus.pt" # Path for cached tokenized data
 MODEL_OUTPUT_DIR = "out/pretrain/"
 os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(CACHED_DATA_PATH), exist_ok=True) # Ensure directory for cache exists
 
 # Training Hyperparameters
 BATCH_SIZE = 4 # Adjusted for 12GB VRAM with block_size=1024
@@ -44,18 +46,31 @@ print("Tokenizer loaded.")
 
 # --- Dataset and DataLoader ---
 class TextDataset(Dataset):
-    def __init__(self, file_path, tokenizer, block_size):
+    def __init__(self, file_path, tokenizer, block_size, cache_path):
         self.block_size = block_size
-        self.tokenizer = tokenizer
-        print(f"Reading and tokenizing data from {file_path}...")
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        
-        # Tokenize the entire text
-        # For very large files, consider streaming and tokenizing in chunks
-        tokenized_output = self.tokenizer.encode(text)
-        self.tokens = torch.tensor(tokenized_output.ids, dtype=torch.long)
-        print(f"Loaded {len(self.tokens)} tokens.")
+        self.tokenizer = tokenizer # Keep tokenizer for potential future use, though not strictly needed if only using cached IDs
+
+        if os.path.exists(cache_path):
+            print(f"Loading tokenized data from cache: {cache_path}")
+            self.tokens = torch.load(cache_path)
+            print(f"Loaded {len(self.tokens)} tokens from cache.")
+        else:
+            print(f"Cache not found. Reading and tokenizing data from {file_path}...")
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Corpus file not found: {file_path}")
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            
+            # Tokenize the entire text
+            # For very large files, consider streaming and tokenizing in chunks
+            print("Tokenizing text (this may take a while)...")
+            tokenized_output = self.tokenizer.encode(text) # Use the passed tokenizer instance
+            self.tokens = torch.tensor(tokenized_output.ids, dtype=torch.long)
+            print(f"Tokenized and loaded {len(self.tokens)} tokens.")
+            print(f"Saving tokenized data to cache: {cache_path}")
+            torch.save(self.tokens, cache_path)
+            print("Cached data saved.")
+
         if len(self.tokens) < block_size + 1:
             raise ValueError(f"Corpus too small for block_size {block_size}. Need at least {block_size + 1} tokens, got {len(self.tokens)}")
 
@@ -71,7 +86,7 @@ class TextDataset(Dataset):
         return x, y
 
 print("Initializing dataset and dataloader...")
-train_dataset = TextDataset(CORPUS_PATH, tokenizer, BLOCK_SIZE)
+train_dataset = TextDataset(CORPUS_PATH, tokenizer, BLOCK_SIZE, CACHED_DATA_PATH)
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 print(f"Dataset size: {len(train_dataset)} samples. Dataloader ready.")
 
@@ -98,9 +113,10 @@ optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.95), weigh
 print("Optimizer AdamW initialized.")
 
 # --- Mixed Precision Training ---
-scaler = torch.cuda.amp.GradScaler(enabled=(DTYPE == torch.float16 and DEVICE == 'cuda'))
+autocast_enabled = (DEVICE == 'cuda' and DTYPE != torch.float32)
+scaler = torch.amp.GradScaler(enabled=autocast_enabled) # Use torch.amp.GradScaler
 print(f"Mixed precision scaler enabled: {scaler.is_enabled()}")
-ctx = torch.amp.autocast(device_type=DEVICE, dtype=DTYPE, enabled=(DTYPE != torch.float32 and DEVICE == 'cuda'))
+ctx = torch.amp.autocast(device_type=DEVICE, dtype=DTYPE, enabled=autocast_enabled)
 
 
 # --- Training Loop ---
