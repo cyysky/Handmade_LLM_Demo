@@ -103,7 +103,8 @@ def get_args():
     # Paths
     parser.add_argument('--tokenizer_path', type=str, default="data/tokenizer/custom_gpt_tokenizer.json", help="Path to the trained tokenizer file.")
     parser.add_argument('--data_path', type=str, default="data/finetuning_data/dolly_15k_instructions.jsonl", help="Path to the fine-tuning data (JSONL).")
-    parser.add_argument('--pretrained_ckpt_path', type=str, required=True, help="Path to the pre-trained model checkpoint (.pt file).")
+    parser.add_argument('--pretrained_ckpt_path', type=str, default=None, help="Path to the base pre-trained model checkpoint (.pt file). Required if not resuming.")
+    parser.add_argument('--resume_from_ckpt_path', type=str, default=None, help="Path to a fine-tuning checkpoint to resume from.")
     parser.add_argument('--out_dir', type=str, default="out/finetune", help="Output directory for saving fine-tuned models and logs.")
 
     # Training hyperparameters
@@ -173,58 +174,93 @@ def main(args):
     print(f"BOS token: '{BOS_TOKEN_STRING}' (ID: {bos_id_for_log}), EOS token: '{EOS_TOKEN_STRING}' (ID: {eos_id_for_log})")
 
 
-    # --- Model Instantiation and Checkpoint Loading ---
-    print(f"Loading pre-trained model from {args.pretrained_ckpt_path}...")
-    checkpoint = torch.load(args.pretrained_ckpt_path, map_location=device)
-    model_args = checkpoint.get('model_args', None)
-    if model_args is None:
-        raise ValueError("Checkpoint must contain 'model_args' dictionary for model instantiation.")
-    
-    # Ensure vocab_size from model_args matches tokenizer, or update if necessary
-    # This assumes pretraining used a compatible tokenizer vocab size.
-    if model_args['vocab_size'] != tokenizer.get_vocab_size():
-        print(f"Warning: Model vocab_size ({model_args['vocab_size']}) differs from tokenizer vocab_size ({tokenizer.get_vocab_size()}). Using model_args' vocab_size.")
-        # This could be problematic if the embedding matrix size is wrong.
-        # For fine-tuning, it's crucial they match or are handled (e.g. resizing embeddings).
-        # For now, we trust model_args from pretraining.
-        pass # vocab_size in model_args will be used for GPT instantiation.
+    # --- Model, Optimizer, Scaler Initialization and Checkpoint Loading ---
+    model = None
+    optimizer = None
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16' and device == 'cuda'))
+    iter_num = 0
+    model_args = {}
 
-    model = GPT(**model_args)
-    state_dict = checkpoint['model_state_dict']
-    
-    # Fix potential issues with state_dict keys (e.g. from DataParallel)
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-            
-    model.load_state_dict(state_dict)
+    if args.resume_from_ckpt_path:
+        print(f"Resuming fine-tuning from checkpoint: {args.resume_from_ckpt_path}")
+        checkpoint = torch.load(args.resume_from_ckpt_path, map_location=device)
+        
+        model_args = checkpoint.get('model_args')
+        if model_args is None:
+            raise ValueError("Resume checkpoint must contain 'model_args'.")
+
+        model = GPT(**model_args)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate) # Re-init with current LR
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Move optimizer state to the correct device
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        iter_num = checkpoint.get('iter_num', 0)
+        print(f"Resumed from iteration {iter_num}.")
+
+    elif args.pretrained_ckpt_path:
+        print(f"Starting fine-tuning from pre-trained model: {args.pretrained_ckpt_path}")
+        checkpoint = torch.load(args.pretrained_ckpt_path, map_location=device)
+        model_args = checkpoint.get('model_args')
+        if model_args is None:
+            raise ValueError("Pre-trained checkpoint must contain 'model_args'.")
+
+        model = GPT(**model_args)
+        state_dict = checkpoint['model_state_dict']
+        unwanted_prefix = '_orig_mod.' # for DataParallel/DDP
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+        # iter_num remains 0, scaler is fresh
+    else:
+        raise ValueError("Either --resume_from_ckpt_path or --pretrained_ckpt_path must be provided.")
+
     model.to(device)
     print(f"Model loaded. Trainable parameters: {model.get_num_params()/1e6:.2f}M")
+    if model_args.get('vocab_size') != tokenizer.get_vocab_size():
+         print(f"Warning: Model vocab_size ({model_args.get('vocab_size')}) differs from tokenizer vocab_size ({tokenizer.get_vocab_size()}). Ensure consistency.")
+
 
     # --- Dataset and DataLoader ---
-    # block_size should come from the loaded model configuration
-    block_size = model_args['block_size'] 
+    block_size = model_args.get('block_size')
+    if block_size is None:
+        raise ValueError("block_size not found in model_args from checkpoint.")
     train_dataset = InstructionDataset(args.data_path, tokenizer, block_size)
-    # The collate_fn needs pad_token_id and ignore_index
     collate_partial = lambda batch: collate_fn(batch, pad_token_id=pad_token_id, ignore_index=IGNORE_INDEX)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_partial, num_workers=0) # num_workers=0 for simplicity
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_partial, num_workers=0)
 
-    # --- Optimizer ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    # If optimizer state was saved in checkpoint and you want to resume:
-    # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    # --- Training Loop ---
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16' and device == 'cuda'))
+    # --- Training Loop Setup ---
+    if args.max_iters <= 0: # Calculate max_iters based on epochs if not set
+        # Adjust max_iters calculation if resuming: only train for remaining iters for the current epoch target
+        # This logic can get complex if num_epochs is the main driver and resuming mid-epoch.
+        # For simplicity, if max_iters is set, it's the total from iter_num = 0.
+        # If resuming, user might need to adjust max_iters or num_epochs.
+        # A common approach: max_iters is the *total* iterations. If resuming, we just continue until max_iters.
+        total_iterations_from_epochs = args.num_epochs * (len(train_loader) // args.gradient_accumulation_steps)
+        if args.resume_from_ckpt_path:
+             # If max_iters was not specified, and we are resuming, assume we want to complete the original num_epochs
+             # This means the *new* max_iters for this run is total_iterations_from_epochs.
+             # The loop will run from current iter_num up to this new max_iters.
+             args.max_iters = total_iterations_from_epochs
+             print(f"Resuming: Target total iterations based on num_epochs ({args.num_epochs}) is {args.max_iters}. Current iter_num is {iter_num}.")
+        else:
+            args.max_iters = total_iterations_from_epochs
     
-    if args.max_iters <= 0:
-        args.max_iters = args.num_epochs * len(train_loader) // args.gradient_accumulation_steps
-    
-    print(f"Starting fine-tuning for {args.max_iters} iterations (effective epochs: {args.num_epochs}).")
+    print(f"Starting/Resuming fine-tuning. Target iterations: {args.max_iters}. Current iteration: {iter_num}.")
     print(f"Batch size: {args.batch_size}, Grad accum steps: {args.gradient_accumulation_steps}, Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
 
-    iter_num = 0
     total_loss = 0.0
     model.train() # Set model to training mode
 
@@ -274,9 +310,10 @@ def main(args):
                     save_checkpoint = {
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
                         'model_args': model_args,
                         'iter_num': iter_num,
-                        'config': vars(args) # Save training configuration
+                        'config': vars(args)
                     }
                     print(f"Saving checkpoint to {checkpoint_path}")
                     torch.save(save_checkpoint, checkpoint_path)
@@ -291,6 +328,7 @@ def main(args):
         final_checkpoint = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'model_args': model_args,
             'iter_num': iter_num,
             'config': vars(args)
