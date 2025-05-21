@@ -7,7 +7,7 @@ from tokenizers import Tokenizer # Import Hugging Face Tokenizer
 
 # Define special token strings that might be needed for logic
 EOS_TOKEN = "[EOS]"
-BOS_TOKEN = "[BOS]" # Needed for checking if tokenizer adds it, or for manual construction if necessary
+BOS_TOKEN = "[BOS]"
 
 def load_hf_tokenizer(tokenizer_path):
     """Loads a Hugging Face Tokenizer from a file."""
@@ -18,12 +18,13 @@ def load_hf_tokenizer(tokenizer_path):
 
 def generate_text(
     model,
-    tokenizer, # Expect a HF Tokenizer object
-    prompt_content_for_tokenizer, # This is the content like "Instruction: ... Response:"
+    tokenizer, 
+    prompt_content_for_tokenizer, 
     device,
     max_new_tokens=150,
     temperature=0.8,
-    top_k=50
+    top_k=50,
+    repetition_penalty=1.0 
 ):
     """Generates text using the fine-tuned model and HF tokenizer."""
     model.eval()
@@ -32,24 +33,11 @@ def generate_text(
     if eos_id is None:
         print(f"Warning: EOS token '{EOS_TOKEN}' not found in tokenizer. Generation might not stop correctly.")
 
-    # Encode the prompt content.
-    # The tokenizer (as configured in train_tokenizer.py) has a post-processor:
-    # TemplateProcessing(single="[BOS] $A [EOS]", ...)
-    # So, tokenizer.encode("Instruction: ... Response:") will produce:
-    # [BOS_ID, tokens("Instruction: ... Response:"), EOS_ID]
     encoded_prompt = tokenizer.encode(prompt_content_for_tokenizer)
     start_ids = encoded_prompt.ids
 
-    # For generation, we want to feed the model the prompt *up to* where it should start generating.
-    # If the template added an EOS at the end of our prompt, we should remove it
-    # so the model doesn't think the sequence is already complete.
     if start_ids and start_ids[-1] == eos_id:
-        # Check if the prompt was just BOS + EOS or something very short.
-        # This logic assumes the prompt_content_for_tokenizer is substantial enough
-        # that an EOS at its end is from the template, not part of the actual desired starting prompt.
-        # A more robust check might involve comparing length against expected BOS + content.
-        # For now, if EOS is last, assume it's template-added and remove for generation.
-        if len(start_ids) > 1 : # Ensure there's more than just an EOS token (or BOS + EOS)
+        if len(start_ids) > 1 : 
             start_ids = start_ids[:-1]
 
     if not start_ids:
@@ -57,25 +45,35 @@ def generate_text(
         return "Error: Tokenized prompt is empty."
 
     input_ids = torch.tensor(start_ids, dtype=torch.long, device=device).unsqueeze(0)
-    generated_ids = list(start_ids) # Keep a Python list for appending
+    generated_ids = list(start_ids) 
 
     for _ in range(max_new_tokens):
-        # Crop context if it exceeds block size
         current_ids_cond = input_ids if input_ids.size(1) <= model.block_size else input_ids[:, -model.block_size:]
         
         with torch.no_grad():
-            logits, _ = model(current_ids_cond) # (B, T, vocab_size)
+            logits, _ = model(current_ids_cond) 
         
-        # Get logits for the last token
-        logits = logits[:, -1, :] / temperature # (B, vocab_size)
-
-        # Apply top-k filtering
+        logits = logits[:, -1, :] # Shape: (B, vocab_size)
+        
+        # Apply repetition penalty
+        if repetition_penalty > 1.0 and current_ids_cond.numel() > 0: # Only apply if there's context
+            # Iterate over unique tokens in the current context window
+            # Using current_ids_cond ensures we only penalize based on what the model just saw
+            for token_id_in_context in torch.unique(current_ids_cond[0]):
+                if logits[0, token_id_in_context] > 0:
+                    logits[0, token_id_in_context] /= repetition_penalty
+                else:
+                    # If logit is negative, multiplying by penalty > 1 makes it more negative
+                    logits[0, token_id_in_context] *= repetition_penalty
+        
+        logits = logits / temperature
+        
         if top_k is not None and top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = -float('Inf')
 
-        probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-        next_token_id_tensor = torch.multinomial(probs, num_samples=1) # (B, 1)
+        probs = F.softmax(logits, dim=-1) 
+        next_token_id_tensor = torch.multinomial(probs, num_samples=1) 
         next_token_id = next_token_id_tensor.item()
 
         generated_ids.append(next_token_id)
@@ -84,9 +82,6 @@ def generate_text(
         if eos_id is not None and next_token_id == eos_id:
             break
             
-    # Decode generated tokens using the HF tokenizer
-    # skip_special_tokens=False to see the full structure including any BOS/EOS.
-    # Set to True if you only want the "content" part of the generation.
     decoded_text = tokenizer.decode(generated_ids, skip_special_tokens=False) 
     
     return decoded_text
@@ -104,9 +99,11 @@ def main():
     parser.add_argument('--max_new_tokens', type=int, default=150,
                         help="Maximum number of new tokens to generate.")
     parser.add_argument('--temperature', type=float, default=0.8,
-                        help="Temperature for sampling (e.g., 0.7-0.9).")
+                        help="Temperature for sampling (e.g., 0.7-0.9). Higher is more random.")
     parser.add_argument('--top_k', type=int, default=50,
                         help="Top-k filtering (e.g., 50). Set to 0 to disable.")
+    parser.add_argument('--repetition_penalty', type=float, default=1.0,
+                        help="Repetition penalty (e.g., 1.1, 1.2). 1.0 means no penalty.")
     parser.add_argument('--device', type=str, default=None,
                         help="Device to use ('cuda', 'cpu'). Auto-detects if None.")
     parser.add_argument('--seed', type=int, default=1337, help="Random seed for reproducibility.")
@@ -122,7 +119,6 @@ def main():
 
     print(f"Using device: {args.device}")
 
-    # 1. Load Tokenizer
     print(f"Loading tokenizer from: {args.tokenizer_path}")
     try:
         tokenizer = load_hf_tokenizer(args.tokenizer_path)
@@ -131,7 +127,6 @@ def main():
         print(f"Error loading tokenizer: {e}")
         return
     
-    # 2. Load Model
     print(f"Loading model checkpoint from: {args.checkpoint_path}")
     if not os.path.exists(args.checkpoint_path):
         print(f"Error: Model checkpoint not found at {args.checkpoint_path}")
@@ -148,7 +143,6 @@ def main():
         print("Error: 'model_args' not found in checkpoint. Cannot initialize model.")
         return
     
-    # Ensure vocab_size in model_args matches the loaded tokenizer
     model_args_dict['vocab_size'] = tokenizer.get_vocab_size()
     print(f"Setting model vocab_size from tokenizer: {model_args_dict['vocab_size']}")
 
@@ -157,8 +151,8 @@ def main():
         if req_arg not in model_args_dict:
             print(f"Error: Required model argument '{req_arg}' not found in checkpoint's model_args.")
             return
-    model_args_dict.setdefault('dropout', 0.1) # Default if not in checkpoint
-    model_args_dict.setdefault('bias', True)    # Default if not in checkpoint
+    model_args_dict.setdefault('dropout', 0.1) 
+    model_args_dict.setdefault('bias', True)    
 
     model = GPT(**model_args_dict)
     
@@ -175,7 +169,6 @@ def main():
         print(f"Available keys in checkpoint: {list(checkpoint.keys())}")
         return
 
-    # Clean up state_dict prefixes if necessary
     unwanted_prefixes = ['_orig_mod.', 'module.']
     cleaned_state_dict = {}
     for k, v in state_dict.items():
@@ -197,14 +190,6 @@ def main():
     model.to(args.device)
     model.eval()
     print("Model loaded successfully.")
-
-    # 3. Format Prompt Content for Tokenizer
-    # This is the string that the tokenizer's `encode` method will process.
-    # The tokenizer's post-processor (from train_tokenizer.py) adds [BOS] at the start
-    # and [EOS] at the end of this content.
-    # Fine-tuning prompt structure: "[BOS] Instruction: {user_instruction} Input: {user_input_if_any} Response:"
-    # So, the content we provide to the tokenizer should be:
-    # "Instruction: {user_instruction} Input: {user_input_if_any} Response:"
     
     prompt_content_for_tokenizer = f"Instruction: {args.prompt}"
     if args.input_text:
@@ -213,7 +198,6 @@ def main():
     
     print(f"\nContent passed to tokenizer.encode():\n'{prompt_content_for_tokenizer}'\n")
 
-    # 4. Generate Text
     print("Generating text...")
     generated_text = generate_text(
         model,
@@ -222,10 +206,10 @@ def main():
         args.device,
         args.max_new_tokens,
         args.temperature,
-        args.top_k
+        args.top_k,
+        args.repetition_penalty 
     )
 
-    # 5. Output
     print("\nGenerated Output:\n")
     print(generated_text)
 
