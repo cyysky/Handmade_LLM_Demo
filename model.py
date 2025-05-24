@@ -54,10 +54,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = n_embd // n_head
         self.dropout = dropout
         
-        # key, query, value projections
-        self.q_proj = nn.Linear(n_embd, n_embd, bias=bias)
-        self.k_proj = nn.Linear(n_embd, n_embd, bias=bias)
-        self.v_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        # Use fused QKV projection for better memory efficiency
+        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd, bias=bias)
         self.o_proj = nn.Linear(n_embd, n_embd, bias=bias)
         
         # regularization
@@ -66,36 +64,53 @@ class CausalSelfAttention(nn.Module):
         
         # flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
-                                        .view(1, 1, block_size, block_size))
 
     def forward(self, x, freqs_cos, freqs_sin):
         B, T, C = x.size()
 
-        # calculate query, key, values
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # Fused QKV computation
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         # apply rotary position embedding
         q, k = apply_rotary_pos_emb(q, k, freqs_cos[:T], freqs_sin[:T])
 
-        # causal self-attention
+        # Always use flash attention for memory efficiency
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True
             )
         else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
+            # Fallback with memory-efficient attention
+            y = self._memory_efficient_attention(q, k, v)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.o_proj(y))
         return y
+    
+    def _memory_efficient_attention(self, q, k, v):
+        # Chunked attention for memory efficiency
+        B, H, T, D = q.shape
+        chunk_size = min(512, T)  # Process in chunks
+        
+        output = torch.zeros_like(v)
+        for i in range(0, T, chunk_size):
+            end_i = min(i + chunk_size, T)
+            q_chunk = q[:, :, i:end_i]
+            
+            att = (q_chunk @ k.transpose(-2, -1)) * (1.0 / math.sqrt(D))
+            # Only compute causal mask for the chunk
+            causal_mask = torch.tril(torch.ones(end_i - i, T, device=q.device))
+            att = att.masked_fill(causal_mask == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            output[:, :, i:end_i] = att @ v
+            
+        return output
 
 class MLP(nn.Module):
     def __init__(self, n_embd, dropout, bias):
@@ -113,6 +128,7 @@ class MLP(nn.Module):
         up = self.up_proj(x)
         return self.dropout(self.down_proj(gate * up))
 
+
 class Block(nn.Module):
     def __init__(self, vocab_size, n_layer, n_head, n_embd, block_size, dropout, bias):
         super().__init__()
@@ -120,12 +136,37 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, bias)
         self.post_attention_layernorm = RMSNorm(n_embd)
         self.mlp = MLP(n_embd, dropout, bias)
+        
+        # Enable gradient checkpointing for memory savings
+        self.gradient_checkpointing = False  # Initialize as False
 
     def forward(self, x, freqs_cos, freqs_sin):
-        # Pre-norm attention
-        x = x + self.attn(self.input_layernorm(x), freqs_cos, freqs_sin)
-        # Pre-norm MLP
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        if self.gradient_checkpointing and self.training:
+            # Use gradient checkpointing to trade compute for memory
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            
+            # Checkpoint the attention block
+            x = x + torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.attn),
+                self.input_layernorm(x),
+                freqs_cos,
+                freqs_sin,
+                use_reentrant=False
+            )
+            
+            # Checkpoint the MLP block
+            x = x + torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.mlp),
+                self.post_attention_layernorm(x),
+                use_reentrant=False
+            )
+        else:
+            # Normal forward pass
+            x = x + self.attn(self.input_layernorm(x), freqs_cos, freqs_sin)
+            x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 class GPT(nn.Module):
@@ -172,6 +213,16 @@ class GPT(nn.Module):
 
         print(f"Model initialized. Number of parameters: {self.get_num_params()/1e6:.2f}M")
 
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for all transformer blocks"""
+        for layer in self.layers:
+            layer.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for all transformer blocks"""
+        for layer in self.layers:
+            layer.gradient_checkpointing = False
+
     def get_num_params(self, non_embedding=True):
         """Return the number of parameters in the model."""
         n_params = sum(p.numel() for p in self.parameters())
@@ -196,16 +247,37 @@ class GPT(nn.Module):
         # Token embeddings
         x = self.dropout(self.embed_tokens(idx))
 
+        # Check for NaN in embeddings
+        if torch.isnan(x).any():
+            print("Warning: NaN detected in embeddings")
+            return None, torch.tensor(float('inf'), device=device)
+
         # Forward through transformer blocks
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x, self.freqs_cos, self.freqs_sin)
+            
+            # Check for NaN after each layer during evaluation (not training for performance)
+            if not self.training and torch.isnan(x).any():
+                print(f"Warning: NaN detected after layer {i}")
+                return None, torch.tensor(float('inf'), device=device)
         
         x = self.norm(x)
 
         if targets is not None:
             # Training mode: compute loss
             logits = self.lm_head(x)
+            
+            # Check for NaN in logits
+            if torch.isnan(logits).any():
+                print("Warning: NaN detected in logits")
+                return logits, torch.tensor(float('inf'), device=device)
+                
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            # Check for NaN in loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Invalid loss computed: {loss.item()}")
+                return logits, torch.tensor(float('inf'), device=device)
         else:
             # Inference mode: only compute logits for last position
             logits = self.lm_head(x[:, [-1], :])
