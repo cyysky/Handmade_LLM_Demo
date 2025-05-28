@@ -4,6 +4,8 @@
 
 This project focuses on creating, pre-training, and instruction fine-tuning a custom small Generative Pre-trained Transformer (GPT) model. The goal is to build a model capable of understanding and responding to instructions.
 
+（Instruction Fine-tuning still Work in progress)
+
 ## 2. Setup & Dependencies
 
 ### Python Version
